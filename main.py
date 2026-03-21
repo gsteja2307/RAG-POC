@@ -1,4 +1,5 @@
 import os
+import json
 from pathlib import Path
 
 import numpy as np
@@ -7,203 +8,241 @@ from google import genai
 
 load_dotenv()
 
+# Initialize Gemini client using API key from .env
 client = genai.Client(
 	api_key=os.getenv('GEMINI_API_KEY')
 )
 
+# File where we will store embeddings locally
+CACHE_FILE = 'embeddings_cache.json'
+
+
+# ---------- FILE LOADING ----------
 
 def read_text_file(file_path: Path) -> str:
+	"""Read a single text file"""
 	with file_path.open('r', encoding='utf-8') as file:
 		return file.read()
 
 
 def load_documents(data_dir: str) -> list[dict[str, str]]:
+	"""Load all .txt files from data folder"""
 	documents: list[dict[str, str]] = []
 	data_path = Path(data_dir)
 
 	for file_path in sorted(data_path.glob('*.txt')):
-		content = read_text_file(file_path)
-
 		documents.append(
 			{
 				'file_name': file_path.name,
-				'content': content
+				'content': read_text_file(file_path)
 			}
 		)
 
 	return documents
 
 
-def chunk_text(text: str, chunk_size: int = 300, overlap: int = 50) -> list[str]:
-	chunks: list[str] = []
-	start_index = 0
-	text_length = len(text)
+# ---------- CHUNKING ----------
 
-	while start_index < text_length:
-		end_index = start_index + chunk_size
-		chunk = text[start_index:end_index].strip()
+def chunk_text(text: str, chunk_size: int = 300, overlap: int = 50) -> list[str]:
+	"""
+	Split text into overlapping chunks
+	Overlap helps preserve context across boundaries
+	"""
+	chunks: list[str] = []
+	start = 0
+
+	while start < len(text):
+		end = start + chunk_size
+		chunk = text[start:end].strip()
 
 		if chunk:
 			chunks.append(chunk)
 
-		if end_index >= text_length:
+		if end >= len(text):
 			break
 
-		start_index += chunk_size - overlap
+		start += chunk_size - overlap
 
 	return chunks
 
 
 def build_chunk_index(documents: list[dict[str, str]]) -> list[dict[str, object]]:
+	"""
+	Create chunk index with metadata
+	This acts like a mini database
+	"""
 	chunk_index: list[dict[str, object]] = []
 
-	for document in documents:
-		file_name = document['file_name']
-		content = document['content']
-		chunks = chunk_text(content, chunk_size=300, overlap=50)
+	for doc in documents:
+		chunks = chunk_text(doc['content'])
 
-		for chunk_number, chunk_text_value in enumerate(chunks, start=1):
+		for i, chunk in enumerate(chunks, start=1):
 			chunk_index.append(
 				{
-					'file_name': file_name,
-					'chunk_number': chunk_number,
-					'content': chunk_text_value
+					'file_name': doc['file_name'],
+					'chunk_number': i,
+					'content': chunk
 				}
 			)
 
 	return chunk_index
 
 
+# ---------- EMBEDDINGS ----------
+
 def embed_texts(texts: list[str]) -> list[list[float]]:
+	"""Call Gemini embedding API"""
 	result = client.models.embed_content(
 		model='gemini-embedding-001',
 		contents=texts
 	)
 
-	return [embedding.values for embedding in result.embeddings]
+	return [e.values for e in result.embeddings]
 
 
-def cosine_similarity(vector_a: list[float], vector_b: list[float]) -> float:
-	array_a = np.array(vector_a)
-	array_b = np.array(vector_b)
+def add_embeddings(chunk_index: list[dict[str, object]]) -> list[dict[str, object]]:
+	"""Attach embeddings to each chunk"""
+	texts = [str(chunk['content']) for chunk in chunk_index]
+	embeddings = embed_texts(texts)
 
-	norm_a = np.linalg.norm(array_a)
-	norm_b = np.linalg.norm(array_b)
+	enriched = []
 
-	if norm_a == 0 or norm_b == 0:
+	for chunk, emb in zip(chunk_index, embeddings):
+		new_chunk = dict(chunk)
+		new_chunk['embedding'] = emb
+		enriched.append(new_chunk)
+
+	return enriched
+
+
+# ---------- CACHE (NEW PART) ----------
+
+def save_cache(chunk_index: list[dict[str, object]]) -> None:
+	"""Save embeddings to disk"""
+	with open(CACHE_FILE, 'w', encoding='utf-8') as f:
+		json.dump(chunk_index, f)
+
+
+def load_cache() -> list[dict[str, object]] | None:
+	"""Load embeddings from disk if exists"""
+	if not os.path.exists(CACHE_FILE):
+		return None
+
+	with open(CACHE_FILE, 'r', encoding='utf-8') as f:
+		return json.load(f)
+
+
+# ---------- SIMILARITY ----------
+
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+	"""Compute cosine similarity between two vectors"""
+	a = np.array(a)
+	b = np.array(b)
+
+	if np.linalg.norm(a) == 0 or np.linalg.norm(b) == 0:
 		return 0.0
 
-	return float(np.dot(array_a, array_b) / (norm_a * norm_b))
+	return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
 
-def add_embeddings_to_chunks(chunk_index: list[dict[str, object]]) -> list[dict[str, object]]:
-	chunk_texts = [str(chunk['content']) for chunk in chunk_index]
-	embeddings = embed_texts(chunk_texts)
-
-	enriched_chunks: list[dict[str, object]] = []
-
-	for chunk, embedding in zip(chunk_index, embeddings):
-		enriched_chunk = dict(chunk)
-		enriched_chunk['embedding'] = embedding
-		enriched_chunks.append(enriched_chunk)
-
-	return enriched_chunks
-
-
-def retrieve_relevant_chunks(
+def retrieve_chunks(
 	chunk_index: list[dict[str, object]],
 	query: str,
 	top_k: int = 4
 ) -> list[dict[str, object]]:
-	query_embedding = embed_texts([query])[0]
-	scored_chunks: list[tuple[dict[str, object], float]] = []
+	"""Find most relevant chunks using embeddings"""
+	query_emb = embed_texts([query])[0]
+
+	scored = []
 
 	for chunk in chunk_index:
-		chunk_embedding = chunk['embedding']
-		similarity = cosine_similarity(query_embedding, chunk_embedding)
-		scored_chunks.append((chunk, similarity))
+		score = cosine_similarity(query_emb, chunk['embedding'])
+		scored.append((chunk, score))
 
-	scored_chunks.sort(key=lambda item: item[1], reverse=True)
+	scored.sort(key=lambda x: x[1], reverse=True)
 
-	return [chunk for chunk, _ in scored_chunks[:top_k]]
+	return [chunk for chunk, _ in scored[:top_k]]
 
 
-def build_prompt(question: str, retrieved_chunks: list[dict[str, object]]) -> str:
-	context_parts: list[str] = []
+# ---------- PROMPT + GENERATION ----------
 
-	for chunk in retrieved_chunks:
-		file_name = str(chunk['file_name'])
-		chunk_number = int(chunk['chunk_number'])
-		content = str(chunk['content'])
+def build_prompt(question: str, chunks: list[dict[str, object]]) -> str:
+	"""Build prompt with context"""
+	context_parts = []
 
+	for c in chunks:
 		context_parts.append(
-			f'[Source: {file_name} | Chunk: {chunk_number}]\n{content}'
+			f"[{c['file_name']} | chunk {c['chunk_number']}]\n{c['content']}"
 		)
 
-	context_text = '\n\n'.join(context_parts)
+	context = '\n\n'.join(context_parts)
 
-	prompt = f"""
-You are a helpful assistant answering questions only from the provided context.
+	return f"""
+Answer ONLY using the context below.
 
 Context:
-{context_text}
+{context}
 
 Question:
 {question}
 
-Instructions:
-- Answer only using the provided context
-- If the answer is not present in the context, say: "I could not find that in the provided documents."
-- Mention the source file names used in the answer
-- Keep the answer simple and clear
+Rules:
+- If not found, say: I could not find that in the provided documents
+- Mention source file names
+- Keep answer simple
 """
 
-	return prompt.strip()
 
+def ask_llm(question: str, chunks: list[dict[str, object]]) -> str:
+	"""Call Gemini for final answer"""
+	prompt = build_prompt(question, chunks)
 
-def ask_gemini(question: str, retrieved_chunks: list[dict[str, object]]) -> str:
-	prompt = build_prompt(question, retrieved_chunks)
-
-	response = client.models.generate_content(
+	res = client.models.generate_content(
 		model='gemini-2.5-flash',
 		contents=prompt
 	)
 
-	return response.text
+	return res.text
 
+
+# ---------- MAIN FLOW ----------
 
 def main() -> None:
-	documents = load_documents('data')
-	chunk_index = build_chunk_index(documents)
+	print("Loading documents...")
+	docs = load_documents('data')
 
-	print(f'Loaded {len(documents)} documents')
-	print(f'Built {len(chunk_index)} chunks')
-	print('Creating embeddings for all chunks...\n')
+	print("Building chunks...")
+	chunks = build_chunk_index(docs)
 
-	chunk_index_with_embeddings = add_embeddings_to_chunks(chunk_index)
+	# Try loading cache
+	cached = load_cache()
 
-	question = input('Ask a question: ').strip()
+	if cached:
+		print("Loaded embeddings from cache ✅")
+		chunks_with_embeddings = cached
+	else:
+		print("Generating embeddings (first run)...")
+		chunks_with_embeddings = add_embeddings(chunks)
 
-	retrieved_chunks = retrieve_relevant_chunks(
-		chunk_index_with_embeddings,
-		question,
-		top_k=4
-	)
+		print("Saving cache...")
+		save_cache(chunks_with_embeddings)
 
-	print('\nRetrieved Chunks:\n')
+	print("\nSystem ready.\n")
 
-	for index, chunk in enumerate(retrieved_chunks, start=1):
-		file_name = str(chunk['file_name'])
-		chunk_number = int(chunk['chunk_number'])
-		content = str(chunk['content'])
+	question = input("Ask a question: ").strip()
 
-		print(f'[{index}] {file_name} | Chunk {chunk_number}')
-		print(content)
-		print('-' * 80)
+	retrieved = retrieve_chunks(chunks_with_embeddings, question)
 
-	answer = ask_gemini(question, retrieved_chunks)
+	print("\nRetrieved chunks:\n")
 
-	print('\nAnswer:\n')
+	for i, c in enumerate(retrieved, 1):
+		print(f"{i}. {c['file_name']} (chunk {c['chunk_number']})")
+		print(c['content'])
+		print("-" * 60)
+
+	answer = ask_llm(question, retrieved)
+
+	print("\nAnswer:\n")
 	print(answer)
 
 
