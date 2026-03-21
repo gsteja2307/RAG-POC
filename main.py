@@ -1,5 +1,7 @@
 import os
 from pathlib import Path
+
+import numpy as np
 from dotenv import load_dotenv
 from google import genai
 
@@ -52,8 +54,8 @@ def chunk_text(text: str, chunk_size: int = 300, overlap: int = 50) -> list[str]
 	return chunks
 
 
-def build_chunk_index(documents: list[dict[str, str]]) -> list[dict[str, str | int]]:
-	chunk_index: list[dict[str, str | int]] = []
+def build_chunk_index(documents: list[dict[str, str]]) -> list[dict[str, object]]:
+	chunk_index: list[dict[str, object]] = []
 
 	for document in documents:
 		file_name = document['file_name']
@@ -72,51 +74,61 @@ def build_chunk_index(documents: list[dict[str, str]]) -> list[dict[str, str | i
 	return chunk_index
 
 
-def normalize_words(text: str) -> list[str]:
-	cleaned_text = text.lower()
+def embed_texts(texts: list[str]) -> list[list[float]]:
+	result = client.models.embed_content(
+		model='gemini-embedding-001',
+		contents=texts
+	)
 
-	for character in [',', '.', ':', ';', '(', ')', '[', ']', '{', '}', '-', '\n']:
-		cleaned_text = cleaned_text.replace(character, ' ')
-
-	words = [word.strip() for word in cleaned_text.split() if word.strip()]
-
-	return words
+	return [embedding.values for embedding in result.embeddings]
 
 
-def score_chunk(chunk_text_value: str, query: str) -> int:
-	query_words = normalize_words(query)
-	chunk_words = normalize_words(chunk_text_value)
-	chunk_word_set = set(chunk_words)
+def cosine_similarity(vector_a: list[float], vector_b: list[float]) -> float:
+	array_a = np.array(vector_a)
+	array_b = np.array(vector_b)
 
-	score = 0
+	norm_a = np.linalg.norm(array_a)
+	norm_b = np.linalg.norm(array_b)
 
-	for word in query_words:
-		if word in chunk_word_set:
-			score += 1
+	if norm_a == 0 or norm_b == 0:
+		return 0.0
 
-	return score
+	return float(np.dot(array_a, array_b) / (norm_a * norm_b))
+
+
+def add_embeddings_to_chunks(chunk_index: list[dict[str, object]]) -> list[dict[str, object]]:
+	chunk_texts = [str(chunk['content']) for chunk in chunk_index]
+	embeddings = embed_texts(chunk_texts)
+
+	enriched_chunks: list[dict[str, object]] = []
+
+	for chunk, embedding in zip(chunk_index, embeddings):
+		enriched_chunk = dict(chunk)
+		enriched_chunk['embedding'] = embedding
+		enriched_chunks.append(enriched_chunk)
+
+	return enriched_chunks
 
 
 def retrieve_relevant_chunks(
-	chunk_index: list[dict[str, str | int]],
+	chunk_index: list[dict[str, object]],
 	query: str,
 	top_k: int = 4
-) -> list[dict[str, str | int]]:
-	scored_chunks: list[tuple[dict[str, str | int], int]] = []
+) -> list[dict[str, object]]:
+	query_embedding = embed_texts([query])[0]
+	scored_chunks: list[tuple[dict[str, object], float]] = []
 
 	for chunk in chunk_index:
-		content = str(chunk['content'])
-		score = score_chunk(content, query)
-		scored_chunks.append((chunk, score))
+		chunk_embedding = chunk['embedding']
+		similarity = cosine_similarity(query_embedding, chunk_embedding)
+		scored_chunks.append((chunk, similarity))
 
 	scored_chunks.sort(key=lambda item: item[1], reverse=True)
 
-	top_chunks = [chunk for chunk, score in scored_chunks if score > 0][:top_k]
-
-	return top_chunks
+	return [chunk for chunk, _ in scored_chunks[:top_k]]
 
 
-def build_prompt(question: str, retrieved_chunks: list[dict[str, str | int]]) -> str:
+def build_prompt(question: str, retrieved_chunks: list[dict[str, object]]) -> str:
 	context_parts: list[str] = []
 
 	for chunk in retrieved_chunks:
@@ -149,7 +161,7 @@ Instructions:
 	return prompt.strip()
 
 
-def ask_gemini(question: str, retrieved_chunks: list[dict[str, str | int]]) -> str:
+def ask_gemini(question: str, retrieved_chunks: list[dict[str, object]]) -> str:
 	prompt = build_prompt(question, retrieved_chunks)
 
 	response = client.models.generate_content(
@@ -165,15 +177,18 @@ def main() -> None:
 	chunk_index = build_chunk_index(documents)
 
 	print(f'Loaded {len(documents)} documents')
-	print(f'Built {len(chunk_index)} chunks\n')
+	print(f'Built {len(chunk_index)} chunks')
+	print('Creating embeddings for all chunks...\n')
+
+	chunk_index_with_embeddings = add_embeddings_to_chunks(chunk_index)
 
 	question = input('Ask a question: ').strip()
 
-	retrieved_chunks = retrieve_relevant_chunks(chunk_index, question, top_k=4)
-
-	if not retrieved_chunks:
-		print('\nNo relevant chunks found.')
-		return
+	retrieved_chunks = retrieve_relevant_chunks(
+		chunk_index_with_embeddings,
+		question,
+		top_k=4
+	)
 
 	print('\nRetrieved Chunks:\n')
 
