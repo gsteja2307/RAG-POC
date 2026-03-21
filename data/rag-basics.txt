@@ -1,0 +1,16 @@
+RAG stands for Retrieval Augmented Generation.
+
+RAG improves large language models by providing external knowledge during inference.
+
+The pipeline includes:
+- document ingestion
+- chunking
+- embeddings
+- storage
+- retrieval
+- prompt augmentation
+- generation
+
+RAG is useful when models do not have access to private or recent data.
+
+RAG systems reduce hallucinations by grounding responses in retrieved context.

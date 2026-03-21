@@ -1,0 +1,9 @@
+Large Language Models (LLMs) generate text based on patterns learned during training.
+
+They do not have real-time access to databases unless integrated with external systems.
+
+LLMs can hallucinate when they lack sufficient context.
+
+Providing structured context improves response accuracy.
+
+Gemini is an example of a large language model that can be used in RAG systems.

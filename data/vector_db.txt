@@ -1,0 +1,9 @@
+A vector database stores embeddings.
+
+Embeddings are numerical representations of text.
+
+Vector databases support similarity search using cosine similarity or dot product.
+
+Examples include FAISS, Pinecone, Weaviate, and Chroma.
+
+Vector search helps retrieve semantically similar documents even when keywords differ.
