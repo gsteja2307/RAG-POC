@@ -1,29 +1,28 @@
+import hashlib
 import os
 from pathlib import Path
 
+import chromadb
 from dotenv import load_dotenv
 from google import genai
-import chromadb
 
 load_dotenv()
 
-# Initialize Gemini client using API key from environment file
+# Initialize Gemini client using the API key from the environment file
 gemini_client = genai.Client(
 	api_key=os.getenv('GEMINI_API_KEY')
 )
 
-# Path where Chroma will persist the local database on disk
+# Path where the local Chroma database will be stored
 chroma_database_path = './chroma_database'
 
-# Name of the collection inside Chroma
+# Name of the Chroma collection that stores document chunks
 chroma_collection_name = 'rag_documents'
 
-# Initialize Chroma persistent client
-# This creates a local on-disk vector database
+# Create a persistent Chroma client
 chroma_client = chromadb.PersistentClient(path=chroma_database_path)
 
-# Create the collection if it does not exist already
-# Or get the existing collection if it is already there
+# Get or create the document collection
 document_collection = chroma_client.get_or_create_collection(
 	name=chroma_collection_name
 )
@@ -32,13 +31,13 @@ document_collection = chroma_client.get_or_create_collection(
 # ---------- FILE LOADING ----------
 
 def read_text_file(file_path: Path) -> str:
-	"""Read and return the contents of a text file"""
+	"""Read and return the content of a text file"""
 	with file_path.open('r', encoding='utf-8') as file:
 		return file.read()
 
 
 def load_documents(data_directory_path: str) -> list[dict[str, str]]:
-	"""Load all text documents from the data folder"""
+	"""Load all .txt files from the data directory"""
 	document_list: list[dict[str, str]] = []
 	data_directory = Path(data_directory_path)
 
@@ -53,6 +52,18 @@ def load_documents(data_directory_path: str) -> list[dict[str, str]]:
 	return document_list
 
 
+# ---------- HASHING ----------
+
+def generate_file_content_hash(file_content: str) -> str:
+	"""
+	Generate a stable hash for the file content.
+
+	This helps detect whether the file content changed
+	since the previous indexing run.
+	"""
+	return hashlib.sha256(file_content.encode('utf-8')).hexdigest()
+
+
 # ---------- TEXT CHUNKING ----------
 
 def chunk_text(
@@ -64,8 +75,7 @@ def chunk_text(
 	Split text into overlapping chunks.
 
 	Why overlap matters:
-	Important context may sit at chunk boundaries.
-	Overlap reduces the risk of splitting meaning awkwardly.
+	It preserves context near chunk boundaries.
 	"""
 	chunk_list: list[str] = []
 	start_index = 0
@@ -73,10 +83,10 @@ def chunk_text(
 
 	while start_index < text_length:
 		end_index = start_index + chunk_size
-		chunk = text_content[start_index:end_index].strip()
+		chunk_content = text_content[start_index:end_index].strip()
 
-		if chunk:
-			chunk_list.append(chunk)
+		if chunk_content:
+			chunk_list.append(chunk_content)
 
 		if end_index >= text_length:
 			break
@@ -86,30 +96,36 @@ def chunk_text(
 	return chunk_list
 
 
-def build_chunk_records(document_list: list[dict[str, str]]) -> list[dict[str, object]]:
+def build_chunk_records_for_document(
+	file_name: str,
+	file_content: str,
+	file_content_hash: str
+) -> list[dict[str, object]]:
 	"""
-	Convert documents into chunk records with metadata.
+	Create chunk records for a single document.
 
-	Each record represents one searchable unit inside the vector database.
+	Each chunk record contains:
+	- unique chunk identifier
+	- file name
+	- chunk number
+	- file content hash
+	- actual chunk content
 	"""
+	chunk_list = chunk_text(file_content)
 	chunk_record_list: list[dict[str, object]] = []
 
-	for document in document_list:
-		file_name = document['file_name']
-		document_content = document['content']
-		chunk_list = chunk_text(document_content)
+	for chunk_number, chunk_content in enumerate(chunk_list, start=1):
+		chunk_identifier = f'{file_name}::chunk::{chunk_number}'
 
-		for chunk_number, chunk_content in enumerate(chunk_list, start=1):
-			chunk_identifier = f'{file_name}::chunk::{chunk_number}'
-
-			chunk_record_list.append(
-				{
-					'chunk_identifier': chunk_identifier,
-					'file_name': file_name,
-					'chunk_number': chunk_number,
-					'chunk_content': chunk_content
-				}
-			)
+		chunk_record_list.append(
+			{
+				'chunk_identifier': chunk_identifier,
+				'file_name': file_name,
+				'chunk_number': chunk_number,
+				'file_content_hash': file_content_hash,
+				'chunk_content': chunk_content
+			}
+		)
 
 	return chunk_record_list
 
@@ -117,9 +133,7 @@ def build_chunk_records(document_list: list[dict[str, str]]) -> list[dict[str, o
 # ---------- EMBEDDINGS ----------
 
 def embed_text_list(text_list: list[str]) -> list[list[float]]:
-	"""
-	Create embeddings for a list of texts using Gemini embedding model.
-	"""
+	"""Generate embeddings for a list of text values"""
 	embedding_response = gemini_client.models.embed_content(
 		model='gemini-embedding-001',
 		contents=text_list
@@ -128,26 +142,71 @@ def embed_text_list(text_list: list[str]) -> list[list[float]]:
 	return [embedding.values for embedding in embedding_response.embeddings]
 
 
-# ---------- CHROMA DATABASE OPERATIONS ----------
+# ---------- CHROMA INSPECTION ----------
 
-def populate_vector_database(chunk_record_list: list[dict[str, object]]) -> None:
+def get_existing_chunks_for_file(file_name: str) -> dict[str, object]:
 	"""
-	Store chunk text, metadata, and embeddings in Chroma.
+	Read existing chunks for a specific file from Chroma.
 
-	This function first clears the existing collection data for a clean rebuild.
-	That is acceptable for a learning proof of concept.
+	We use this to determine:
+	- whether the file has already been indexed
+	- what hash was used previously
 	"""
-	global document_collection
+	query_result = document_collection.get(
+		where={'file_name': file_name},
+		include=['metadatas']
+	)
 
-	existing_record_count = document_collection.count()
+	return query_result
 
-	if existing_record_count > 0:
-		# Delete old collection and recreate it to avoid duplicate inserts
-		chroma_client.delete_collection(name=chroma_collection_name)
 
-		document_collection = chroma_client.get_or_create_collection(
-			name=chroma_collection_name
-		)
+def get_existing_file_hash(file_name: str) -> str | None:
+	"""
+	Get the stored file content hash for a given file.
+
+	If the file does not exist in Chroma, return None.
+	"""
+	query_result = get_existing_chunks_for_file(file_name)
+
+	metadata_list = query_result.get('metadatas', [])
+
+	if not metadata_list:
+		return None
+
+	first_metadata = metadata_list[0]
+
+	if not first_metadata:
+		return None
+
+	return first_metadata.get('file_content_hash')
+
+
+# ---------- CHROMA WRITE OPERATIONS ----------
+
+def delete_existing_chunks_for_file(file_name: str) -> None:
+	"""
+	Delete all chunks belonging to a specific file.
+
+	We do this before inserting updated chunks for a changed file.
+	"""
+	existing_query_result = document_collection.get(
+		where={'file_name': file_name}
+	)
+
+	existing_identifier_list = existing_query_result.get('ids', [])
+
+	if existing_identifier_list:
+		document_collection.delete(ids=existing_identifier_list)
+
+
+def add_chunk_records_to_vector_database(
+	chunk_record_list: list[dict[str, object]]
+) -> None:
+	"""
+	Add new chunk records and their embeddings to Chroma.
+	"""
+	if not chunk_record_list:
+		return
 
 	chunk_identifier_list = [
 		str(chunk_record['chunk_identifier'])
@@ -162,7 +221,8 @@ def populate_vector_database(chunk_record_list: list[dict[str, object]]) -> None
 	chunk_metadata_list = [
 		{
 			'file_name': str(chunk_record['file_name']),
-			'chunk_number': int(chunk_record['chunk_number'])
+			'chunk_number': int(chunk_record['chunk_number']),
+			'file_content_hash': str(chunk_record['file_content_hash'])
 		}
 		for chunk_record in chunk_record_list
 	]
@@ -177,14 +237,50 @@ def populate_vector_database(chunk_record_list: list[dict[str, object]]) -> None
 	)
 
 
+def synchronize_documents_to_vector_database(
+	document_list: list[dict[str, str]]
+) -> None:
+	"""
+	Incrementally synchronize local files into Chroma.
+
+	For each file:
+	- compute content hash
+	- compare with existing stored hash
+	- if unchanged, skip
+	- if changed or new, delete old chunks and insert fresh chunks
+	"""
+	for document in document_list:
+		file_name = document['file_name']
+		file_content = document['content']
+		file_content_hash = generate_file_content_hash(file_content)
+
+		existing_file_hash = get_existing_file_hash(file_name)
+
+		if existing_file_hash == file_content_hash:
+			print(f'Skipping unchanged file: {file_name}')
+			continue
+
+		print(f'Indexing new or changed file: {file_name}')
+
+		delete_existing_chunks_for_file(file_name)
+
+		chunk_record_list = build_chunk_records_for_document(
+			file_name=file_name,
+			file_content=file_content,
+			file_content_hash=file_content_hash
+		)
+
+		add_chunk_records_to_vector_database(chunk_record_list)
+
+
+# ---------- VECTOR DATABASE QUERY ----------
+
 def query_vector_database(
 	question: str,
 	top_result_count: int = 4
 ) -> list[dict[str, object]]:
 	"""
-	Query Chroma using the embedding of the user question.
-
-	Chroma returns the nearest chunks from the vector database.
+	Query Chroma using the embedding of the user's question.
 	"""
 	question_embedding = embed_text_list([question])[0]
 
@@ -195,22 +291,28 @@ def query_vector_database(
 
 	retrieved_chunk_list: list[dict[str, object]] = []
 
-	result_identifiers = query_result['ids'][0]
-	result_documents = query_result['documents'][0]
-	result_metadatas = query_result['metadatas'][0]
-	result_distances = query_result['distances'][0]
+	result_identifier_list = query_result['ids'][0]
+	result_document_list = query_result['documents'][0]
+	result_metadata_list = query_result['metadatas'][0]
+	result_distance_list = query_result['distances'][0]
 
-	for chunk_identifier, chunk_document, chunk_metadata, chunk_distance in zip(
-		result_identifiers,
-		result_documents,
-		result_metadatas,
-		result_distances
+	for (
+		chunk_identifier,
+		chunk_document,
+		chunk_metadata,
+		chunk_distance
+	) in zip(
+		result_identifier_list,
+		result_document_list,
+		result_metadata_list,
+		result_distance_list
 	):
 		retrieved_chunk_list.append(
 			{
 				'chunk_identifier': chunk_identifier,
 				'file_name': chunk_metadata['file_name'],
 				'chunk_number': chunk_metadata['chunk_number'],
+				'file_content_hash': chunk_metadata['file_content_hash'],
 				'chunk_content': chunk_document,
 				'distance': chunk_distance
 			}
@@ -219,14 +321,14 @@ def query_vector_database(
 	return retrieved_chunk_list
 
 
-# ---------- PROMPT BUILDING + GENERATION ----------
+# ---------- PROMPT BUILDING ----------
 
 def build_grounded_prompt(
 	question: str,
 	retrieved_chunk_list: list[dict[str, object]]
 ) -> str:
 	"""
-	Build a prompt that forces the language model to answer from retrieved context only.
+	Build a grounded prompt from retrieved chunks.
 	"""
 	context_part_list: list[str] = []
 
@@ -267,9 +369,12 @@ def generate_answer_from_retrieved_context(
 	retrieved_chunk_list: list[dict[str, object]]
 ) -> str:
 	"""
-	Send retrieved context to Gemini and generate the final grounded answer.
+	Generate the final answer using Gemini and the retrieved context.
 	"""
-	prompt = build_grounded_prompt(question, retrieved_chunk_list)
+	prompt = build_grounded_prompt(
+		question=question,
+		retrieved_chunk_list=retrieved_chunk_list
+	)
 
 	generation_response = gemini_client.models.generate_content(
 		model='gemini-2.5-flash',
@@ -279,17 +384,14 @@ def generate_answer_from_retrieved_context(
 	return generation_response.text
 
 
-# ---------- MAIN PROGRAM FLOW ----------
+# ---------- MAIN PROGRAM ----------
 
 def main() -> None:
-	print('Loading documents from data folder...')
+	print('Loading local documents...')
 	document_list = load_documents('data')
 
-	print('Building chunk records...')
-	chunk_record_list = build_chunk_records(document_list)
-
-	print('Storing chunks and embeddings in local Chroma database...')
-	populate_vector_database(chunk_record_list)
+	print('Synchronizing documents into Chroma vector database...')
+	synchronize_documents_to_vector_database(document_list)
 
 	print('\nSystem is ready.\n')
 
@@ -300,10 +402,10 @@ def main() -> None:
 		top_result_count=4
 	)
 
-	print('\nRetrieved chunks from Chroma:\n')
+	print('\nRetrieved chunks:\n')
 
-	for index, chunk_record in enumerate(retrieved_chunk_list, start=1):
-		print(f'Result {index}')
+	for result_number, chunk_record in enumerate(retrieved_chunk_list, start=1):
+		print(f'Result {result_number}')
 		print(f"Source file: {chunk_record['file_name']}")
 		print(f"Chunk number: {chunk_record['chunk_number']}")
 		print(f"Distance: {chunk_record['distance']}")
