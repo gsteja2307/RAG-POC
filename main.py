@@ -181,6 +181,32 @@ def get_existing_file_hash(file_name: str) -> str | None:
 	return first_metadata.get('file_content_hash')
 
 
+def get_all_indexed_file_names() -> set[str]:
+	"""
+	Return all unique file names currently stored in Chroma.
+
+	We read metadata of all records and extract unique file names.
+	"""
+	query_result = document_collection.get(include=['metadatas'])
+
+	metadata_list = query_result.get('metadatas', [])
+
+	indexed_file_name_set: set[str] = set()
+
+	for metadata in metadata_list:
+		if metadata and 'file_name' in metadata:
+			indexed_file_name_set.add(metadata['file_name'])
+
+	return indexed_file_name_set
+
+
+def get_all_local_file_names(document_list: list[dict[str, str]]) -> set[str]:
+	"""
+	Return all file names from the local data folder.
+	"""
+	return {document['file_name'] for document in document_list}
+
+
 # ---------- CHROMA WRITE OPERATIONS ----------
 
 def delete_existing_chunks_for_file(file_name: str) -> None:
@@ -197,6 +223,23 @@ def delete_existing_chunks_for_file(file_name: str) -> None:
 
 	if existing_identifier_list:
 		document_collection.delete(ids=existing_identifier_list)
+
+
+def delete_chunks_for_file(file_name: str) -> None:
+	"""
+	Delete all chunks belonging to a specific file.
+
+	This is used for deleted files that no longer exist locally.
+	"""
+	query_result = document_collection.get(
+		where={'file_name': file_name}
+	)
+
+	identifier_list = query_result.get('ids', [])
+
+	if identifier_list:
+		document_collection.delete(ids=identifier_list)
+		print(f'Deleted stale file from index: {file_name}')
 
 
 def add_chunk_records_to_vector_database(
@@ -235,6 +278,27 @@ def add_chunk_records_to_vector_database(
 		metadatas=chunk_metadata_list,
 		embeddings=chunk_embedding_list
 	)
+
+
+def remove_deleted_files_from_vector_database(
+	document_list: list[dict[str, str]]
+) -> None:
+	"""
+	Remove files from Chroma that no longer exist in local data folder.
+	"""
+	local_file_name_set = get_all_local_file_names(document_list)
+	indexed_file_name_set = get_all_indexed_file_names()
+
+	stale_file_name_set = indexed_file_name_set - local_file_name_set
+
+	if not stale_file_name_set:
+		print('No deleted files detected.')
+		return
+
+	print('\nCleaning up deleted files...')
+
+	for file_name in stale_file_name_set:
+		delete_chunks_for_file(file_name)
 
 
 def synchronize_documents_to_vector_database(
@@ -389,6 +453,9 @@ def generate_answer_from_retrieved_context(
 def main() -> None:
 	print('Loading local documents...')
 	document_list = load_documents('data')
+
+	print('Cleaning up deleted files...')
+	remove_deleted_files_from_vector_database(document_list)
 
 	print('Synchronizing documents into Chroma vector database...')
 	synchronize_documents_to_vector_database(document_list)
