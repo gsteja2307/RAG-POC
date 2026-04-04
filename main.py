@@ -68,33 +68,86 @@ def generate_file_content_hash(file_content: str) -> str:
 
 def chunk_text(
 	text_content: str,
-	chunk_size: int = 300,
-	overlap_size: int = 50
+	max_chunk_size: int = 500,
+	overlap_size: int = 100
 ) -> list[str]:
 	"""
-	Split text into overlapping chunks.
-
-	Why overlap matters:
-	It preserves context near chunk boundaries.
+	Semantic-aware chunking:
+	1. Split by paragraphs
+	2. Combine paragraphs into chunks
+	3. Fallback split if chunk too large
+	4. Add overlap between chunks
 	"""
+
+	# Step 1: split into paragraphs
+	paragraph_list = [
+		paragraph.strip()
+		for paragraph in text_content.split('\n')
+		if paragraph.strip()
+	]
+
 	chunk_list: list[str] = []
-	start_index = 0
-	text_length = len(text_content)
+	current_chunk_parts: list[str] = []
+	current_length = 0
 
-	while start_index < text_length:
-		end_index = start_index + chunk_size
-		chunk_content = text_content[start_index:end_index].strip()
+	# Step 2: build chunks from paragraphs
+	for paragraph in paragraph_list:
+		paragraph_length = len(paragraph)
 
-		if chunk_content:
-			chunk_list.append(chunk_content)
+		# If adding paragraph exceeds limit → flush current chunk
+		if current_length + paragraph_length > max_chunk_size and current_chunk_parts:
+			chunk_list.append(' '.join(current_chunk_parts))
 
-		if end_index >= text_length:
-			break
+			current_chunk_parts = []
+			current_length = 0
 
-		start_index += chunk_size - overlap_size
+		current_chunk_parts.append(paragraph)
+		current_length += paragraph_length
 
-	return chunk_list
+	# Add remaining chunk
+	if current_chunk_parts:
+		chunk_list.append(' '.join(current_chunk_parts))
 
+	# Step 3: fallback splitting for oversized chunks
+	final_chunk_list: list[str] = []
+
+	for chunk in chunk_list:
+		if len(chunk) <= max_chunk_size:
+			final_chunk_list.append(chunk)
+			continue
+
+		# Split large chunk into smaller parts
+		start_index = 0
+
+		while start_index < len(chunk):
+			end_index = start_index + max_chunk_size
+			sub_chunk = chunk[start_index:end_index].strip()
+
+			if sub_chunk:
+				final_chunk_list.append(sub_chunk)
+
+			if end_index >= len(chunk):
+				break
+
+			start_index += max_chunk_size - overlap_size
+
+	# Step 4: add overlap between chunks
+	overlapped_chunk_list: list[str] = []
+
+	for index, chunk in enumerate(final_chunk_list):
+		if index == 0:
+			overlapped_chunk_list.append(chunk)
+			continue
+
+		previous_chunk = overlapped_chunk_list[-1]
+
+		overlap_text = previous_chunk[-overlap_size:]
+
+		new_chunk = overlap_text + ' ' + chunk
+
+		overlapped_chunk_list.append(new_chunk.strip())
+
+	return overlapped_chunk_list
 
 def build_chunk_records_for_document(
 	file_name: str,
