@@ -14,3 +14,5 @@ The pipeline includes:
 RAG is useful when models do not have access to private or recent data.
 
 RAG systems reduce hallucinations by grounding responses in retrieved context.
+
+Hybrid search combines keyword search and semantic search.
