@@ -6,46 +6,60 @@ import chromadb
 from dotenv import load_dotenv
 from google import genai
 
+load_dotenv()
+
 # ---------- CONFIGURATION ----------
 
+# Maximum size of a chunk in characters
 MAX_CHUNK_SIZE = 500
+
+# Number of characters to overlap between neighbouring chunks
 OVERLAP_SIZE = 100
+
+# Number of top results to finally return to the language model
 TOP_RESULT_COUNT = 4
-MINIMUM_SIMILARITY_THRESHOLD = 0.3   # lower distance = better match
+
+# Chroma returns distance, not similarity.
+# Lower distance means better match.
+# Keep only results whose distance is less than or equal to this value.
+MINIMUM_DISTANCE_THRESHOLD = 0.7
+
+# Enable extra logs for debugging retrieval behaviour
 DEBUG_MODE = True
 
-load_dotenv()
+# Path where the local Chroma database will be stored
+CHROMA_DATABASE_PATH = './chroma_database'
+
+# Name of the Chroma collection that stores document chunks
+CHROMA_COLLECTION_NAME = 'rag_documents'
+
+
+# ---------- CLIENT INITIALIZATION ----------
 
 # Initialize Gemini client using the API key from the environment file
 gemini_client = genai.Client(
 	api_key=os.getenv('GEMINI_API_KEY')
 )
 
-# Path where the local Chroma database will be stored
-chroma_database_path = './chroma_database'
-
-# Name of the Chroma collection that stores document chunks
-chroma_collection_name = 'rag_documents'
-
 # Create a persistent Chroma client
-chroma_client = chromadb.PersistentClient(path=chroma_database_path)
+chroma_client = chromadb.PersistentClient(path=CHROMA_DATABASE_PATH)
 
 # Get or create the document collection
 document_collection = chroma_client.get_or_create_collection(
-	name=chroma_collection_name
+	name=CHROMA_COLLECTION_NAME
 )
 
 
 # ---------- FILE LOADING ----------
 
 def read_text_file(file_path: Path) -> str:
-	"""Read and return the content of a text file"""
+	"""Read and return the content of a text file."""
 	with file_path.open('r', encoding='utf-8') as file:
 		return file.read()
 
 
 def load_documents(data_directory_path: str) -> list[dict[str, str]]:
-	"""Load all .txt files from the data directory"""
+	"""Load all .txt files from the data directory."""
 	document_list: list[dict[str, str]] = []
 	data_directory = Path(data_directory_path)
 
@@ -76,18 +90,18 @@ def generate_file_content_hash(file_content: str) -> str:
 
 def chunk_text(
 	text_content: str,
-	max_chunk_size: int = 500,
-	overlap_size: int = 100
+	max_chunk_size: int = MAX_CHUNK_SIZE,
+	overlap_size: int = OVERLAP_SIZE
 ) -> list[str]:
 	"""
 	Semantic-aware chunking:
 	1. Split by paragraphs
 	2. Combine paragraphs into chunks
-	3. Fallback split if chunk too large
-	4. Add overlap between chunks
+	3. Fallback split if a chunk is too large
+	4. Add overlap between neighbouring chunks
 	"""
 
-	# Step 1: split into paragraphs
+	# Split text into non-empty paragraphs
 	paragraph_list = [
 		paragraph.strip()
 		for paragraph in text_content.split('\n')
@@ -95,28 +109,31 @@ def chunk_text(
 	]
 
 	chunk_list: list[str] = []
-	current_chunk_parts: list[str] = []
-	current_length = 0
+	current_chunk_part_list: list[str] = []
+	current_chunk_length = 0
 
-	# Step 2: build chunks from paragraphs
+	# Build chunks by combining paragraphs until size limit is reached
 	for paragraph in paragraph_list:
 		paragraph_length = len(paragraph)
 
-		# If adding paragraph exceeds limit → flush current chunk
-		if current_length + paragraph_length > max_chunk_size and current_chunk_parts:
-			chunk_list.append(' '.join(current_chunk_parts))
+		# If adding this paragraph exceeds the max chunk size,
+		# save the current chunk first.
+		if (
+			current_chunk_length + paragraph_length > max_chunk_size
+			and current_chunk_part_list
+		):
+			chunk_list.append(' '.join(current_chunk_part_list))
+			current_chunk_part_list = []
+			current_chunk_length = 0
 
-			current_chunk_parts = []
-			current_length = 0
+		current_chunk_part_list.append(paragraph)
+		current_chunk_length += paragraph_length
 
-		current_chunk_parts.append(paragraph)
-		current_length += paragraph_length
+	# Add the final remaining chunk
+	if current_chunk_part_list:
+		chunk_list.append(' '.join(current_chunk_part_list))
 
-	# Add remaining chunk
-	if current_chunk_parts:
-		chunk_list.append(' '.join(current_chunk_parts))
-
-	# Step 3: fallback splitting for oversized chunks
+	# Fallback split for very large chunks
 	final_chunk_list: list[str] = []
 
 	for chunk in chunk_list:
@@ -124,7 +141,6 @@ def chunk_text(
 			final_chunk_list.append(chunk)
 			continue
 
-		# Split large chunk into smaller parts
 		start_index = 0
 
 		while start_index < len(chunk):
@@ -139,23 +155,22 @@ def chunk_text(
 
 			start_index += max_chunk_size - overlap_size
 
-	# Step 4: add overlap between chunks
+	# Add overlap between neighbouring chunks
 	overlapped_chunk_list: list[str] = []
 
-	for index, chunk in enumerate(final_chunk_list):
-		if index == 0:
+	for chunk_index, chunk in enumerate(final_chunk_list):
+		if chunk_index == 0:
 			overlapped_chunk_list.append(chunk)
 			continue
 
 		previous_chunk = overlapped_chunk_list[-1]
-
 		overlap_text = previous_chunk[-overlap_size:]
-
 		new_chunk = overlap_text + ' ' + chunk
 
 		overlapped_chunk_list.append(new_chunk.strip())
 
 	return overlapped_chunk_list
+
 
 def build_chunk_records_for_document(
 	file_name: str,
@@ -173,10 +188,11 @@ def build_chunk_records_for_document(
 	- actual chunk content
 	"""
 	chunk_list = chunk_text(
-	text_content=file_content,
-	max_chunk_size=MAX_CHUNK_SIZE,
-	overlap_size=OVERLAP_SIZE
-)
+		text_content=file_content,
+		max_chunk_size=MAX_CHUNK_SIZE,
+		overlap_size=OVERLAP_SIZE
+	)
+
 	chunk_record_list: list[dict[str, object]] = []
 
 	for chunk_number, chunk_content in enumerate(chunk_list, start=1):
@@ -198,7 +214,7 @@ def build_chunk_records_for_document(
 # ---------- EMBEDDINGS ----------
 
 def embed_text_list(text_list: list[str]) -> list[list[float]]:
-	"""Generate embeddings for a list of text values"""
+	"""Generate embeddings for a list of text values."""
 	embedding_response = gemini_client.models.embed_content(
 		model='gemini-embedding-001',
 		contents=text_list
@@ -232,7 +248,6 @@ def get_existing_file_hash(file_name: str) -> str | None:
 	If the file does not exist in Chroma, return None.
 	"""
 	query_result = get_existing_chunks_for_file(file_name)
-
 	metadata_list = query_result.get('metadatas', [])
 
 	if not metadata_list:
@@ -249,11 +264,8 @@ def get_existing_file_hash(file_name: str) -> str | None:
 def get_all_indexed_file_names() -> set[str]:
 	"""
 	Return all unique file names currently stored in Chroma.
-
-	We read metadata of all records and extract unique file names.
 	"""
 	query_result = document_collection.get(include=['metadatas'])
-
 	metadata_list = query_result.get('metadatas', [])
 
 	indexed_file_name_set: set[str] = set()
@@ -266,9 +278,7 @@ def get_all_indexed_file_names() -> set[str]:
 
 
 def get_all_local_file_names(document_list: list[dict[str, str]]) -> set[str]:
-	"""
-	Return all file names from the local data folder.
-	"""
+	"""Return all file names from the local data folder."""
 	return {document['file_name'] for document in document_list}
 
 
@@ -310,9 +320,7 @@ def delete_chunks_for_file(file_name: str) -> None:
 def add_chunk_records_to_vector_database(
 	chunk_record_list: list[dict[str, object]]
 ) -> None:
-	"""
-	Add new chunk records and their embeddings to Chroma.
-	"""
+	"""Add new chunk records and their embeddings to Chroma."""
 	if not chunk_record_list:
 		return
 
@@ -409,15 +417,16 @@ def query_vector_database(
 	top_result_count: int = TOP_RESULT_COUNT
 ) -> list[dict[str, object]]:
 	"""
-	Query Chroma using embedding of the user's question.
-	Apply similarity threshold filtering.
-	"""
+	Query Chroma using the embedding of the user's question.
 
+	We fetch extra results first, then apply distance filtering,
+	then keep only the requested final number of results.
+	"""
 	question_embedding = embed_text_list([question])[0]
 
 	query_result = document_collection.query(
 		query_embeddings=[question_embedding],
-		n_results=top_result_count * 2  # fetch extra to filter later
+		n_results=top_result_count * 2
 	)
 
 	retrieved_chunk_list: list[dict[str, object]] = []
@@ -438,8 +447,7 @@ def query_vector_database(
 		result_metadata_list,
 		result_distance_list
 	):
-		# Apply similarity threshold filter
-		if chunk_distance > MINIMUM_SIMILARITY_THRESHOLD:
+		if chunk_distance > MINIMUM_DISTANCE_THRESHOLD:
 			continue
 
 		retrieved_chunk_list.append(
@@ -453,8 +461,8 @@ def query_vector_database(
 			}
 		)
 
-	# Limit to top_k AFTER filtering
 	return retrieved_chunk_list[:top_result_count]
+
 
 # ---------- PROMPT BUILDING ----------
 
@@ -503,9 +511,7 @@ def generate_answer_from_retrieved_context(
 	question: str,
 	retrieved_chunk_list: list[dict[str, object]]
 ) -> str:
-	"""
-	Generate the final answer using Gemini and the retrieved context.
-	"""
+	"""Generate the final answer using Gemini and the retrieved context."""
 	prompt = build_grounded_prompt(
 		question=question,
 		retrieved_chunk_list=retrieved_chunk_list
@@ -517,6 +523,101 @@ def generate_answer_from_retrieved_context(
 	)
 
 	return generation_response.text
+
+
+# ---------- TOOL FUNCTIONS ----------
+
+def tool_list_all_files() -> str:
+	"""Return the list of indexed files."""
+	indexed_file_name_set = get_all_indexed_file_names()
+
+	if not indexed_file_name_set:
+		return 'No files indexed.'
+
+	return 'Indexed files:\n' + '\n'.join(sorted(indexed_file_name_set))
+
+
+def tool_show_file_chunks(file_name: str) -> str:
+	"""Return all chunks of a specific file."""
+	result = document_collection.get(
+		where={'file_name': file_name}
+	)
+
+	document_list = result.get('documents', [])
+	metadata_list = result.get('metadatas', [])
+
+	if not document_list:
+		return f'No data found for file: {file_name}'
+
+	output_line_list: list[str] = []
+
+	for index in range(len(document_list)):
+		chunk_number = metadata_list[index]['chunk_number']
+		chunk_content = document_list[index]
+
+		output_line_list.append(f'Chunk {chunk_number}:\n{chunk_content}\n')
+
+	return '\n'.join(output_line_list)
+
+
+def tool_reindex_all_documents(document_list: list[dict[str, str]]) -> str:
+	"""Force reindex all documents."""
+	global document_collection
+
+	print('Reindexing all documents...')
+
+	chroma_client.delete_collection(name=CHROMA_COLLECTION_NAME)
+
+	document_collection = chroma_client.get_or_create_collection(
+		name=CHROMA_COLLECTION_NAME
+	)
+
+	synchronize_documents_to_vector_database(document_list)
+
+	return 'Reindex completed.'
+
+
+# ---------- INTENT CLASSIFICATION ----------
+
+def classify_user_intent(user_input: str) -> dict[str, object]:
+	"""
+	Simple rule-based intent classifier.
+
+	Returns either:
+	- tool intent
+	- rag intent
+	"""
+	lower_input = user_input.lower()
+
+	if 'list files' in lower_input or 'show files' in lower_input:
+		return {
+			'type': 'tool',
+			'tool_name': 'list_files'
+		}
+
+	if 'show file' in lower_input:
+		input_parts = lower_input.split('show file')
+
+		if len(input_parts) > 1:
+			file_name = input_parts[1].strip()
+
+			return {
+				'type': 'tool',
+				'tool_name': 'show_file',
+				'arguments': {
+					'file_name': file_name
+				}
+			}
+
+	if 'reindex' in lower_input:
+		return {
+			'type': 'tool',
+			'tool_name': 'reindex'
+		}
+
+	return {
+		'type': 'rag'
+	}
 
 
 # ---------- MAIN PROGRAM ----------
@@ -533,31 +634,67 @@ def main() -> None:
 
 	print('\nSystem is ready.\n')
 
-	question = input('Ask a question: ').strip()
+	user_input = input('Ask a question: ').strip()
+	intent = classify_user_intent(user_input)
+
+	# ---------- TOOL EXECUTION ----------
+
+	if intent['type'] == 'tool':
+		tool_name = intent.get('tool_name')
+
+		if tool_name == 'list_files':
+			result = tool_list_all_files()
+			print('\nTool Output:\n')
+			print(result)
+			return
+
+		if tool_name == 'show_file':
+			file_name = intent.get('arguments', {}).get('file_name', '')
+			result = tool_show_file_chunks(file_name)
+			print('\nTool Output:\n')
+			print(result)
+			return
+
+		if tool_name == 'reindex':
+			result = tool_reindex_all_documents(document_list)
+			print('\nTool Output:\n')
+			print(result)
+			return
+
+	# ---------- RAG FLOW ----------
 
 	retrieved_chunk_list = query_vector_database(
-		question=question,
-		top_result_count=4
+		question=user_input,
+		top_result_count=TOP_RESULT_COUNT
 	)
+
+	if not retrieved_chunk_list:
+		print('\nNo relevant chunks found (after filtering).')
+		print('Try lowering threshold or rephrasing the query.\n')
+		return
 
 	print('\nRetrieved chunks:\n')
 
 	if DEBUG_MODE:
 		print('--- DEBUG INFO ---')
-		print(f'Top K: {TOP_RESULT_COUNT}')
-		print(f'Threshold: {MINIMUM_SIMILARITY_THRESHOLD}')
+		print(f'Top result count: {TOP_RESULT_COUNT}')
+		print(f'Minimum distance threshold: {MINIMUM_DISTANCE_THRESHOLD}')
 		print('------------------\n')
 
 	for result_number, chunk_record in enumerate(retrieved_chunk_list, start=1):
 		print(f'Result {result_number}')
 		print(f"Source file: {chunk_record['file_name']}")
 		print(f"Chunk number: {chunk_record['chunk_number']}")
-		print(f"Distance: {chunk_record['distance']}")
-		print(f"Content: {chunk_record['chunk_content']}")
+		print(f"Distance: {chunk_record['distance']:.4f}")
+
+		if DEBUG_MODE:
+			print(f"Content length: {len(chunk_record['chunk_content'])}")
+
+		print(f"Content:\n{chunk_record['chunk_content']}")
 		print('-' * 80)
 
 	answer = generate_answer_from_retrieved_context(
-		question=question,
+		question=user_input,
 		retrieved_chunk_list=retrieved_chunk_list
 	)
 
