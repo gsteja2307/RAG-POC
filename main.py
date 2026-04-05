@@ -6,6 +6,14 @@ import chromadb
 from dotenv import load_dotenv
 from google import genai
 
+# ---------- CONFIGURATION ----------
+
+MAX_CHUNK_SIZE = 500
+OVERLAP_SIZE = 100
+TOP_RESULT_COUNT = 4
+MINIMUM_SIMILARITY_THRESHOLD = 0.3   # lower distance = better match
+DEBUG_MODE = True
+
 load_dotenv()
 
 # Initialize Gemini client using the API key from the environment file
@@ -164,7 +172,11 @@ def build_chunk_records_for_document(
 	- file content hash
 	- actual chunk content
 	"""
-	chunk_list = chunk_text(file_content)
+	chunk_list = chunk_text(
+	text_content=file_content,
+	max_chunk_size=MAX_CHUNK_SIZE,
+	overlap_size=OVERLAP_SIZE
+)
 	chunk_record_list: list[dict[str, object]] = []
 
 	for chunk_number, chunk_content in enumerate(chunk_list, start=1):
@@ -394,16 +406,18 @@ def synchronize_documents_to_vector_database(
 
 def query_vector_database(
 	question: str,
-	top_result_count: int = 4
+	top_result_count: int = TOP_RESULT_COUNT
 ) -> list[dict[str, object]]:
 	"""
-	Query Chroma using the embedding of the user's question.
+	Query Chroma using embedding of the user's question.
+	Apply similarity threshold filtering.
 	"""
+
 	question_embedding = embed_text_list([question])[0]
 
 	query_result = document_collection.query(
 		query_embeddings=[question_embedding],
-		n_results=top_result_count
+		n_results=top_result_count * 2  # fetch extra to filter later
 	)
 
 	retrieved_chunk_list: list[dict[str, object]] = []
@@ -424,6 +438,10 @@ def query_vector_database(
 		result_metadata_list,
 		result_distance_list
 	):
+		# Apply similarity threshold filter
+		if chunk_distance > MINIMUM_SIMILARITY_THRESHOLD:
+			continue
+
 		retrieved_chunk_list.append(
 			{
 				'chunk_identifier': chunk_identifier,
@@ -435,8 +453,8 @@ def query_vector_database(
 			}
 		)
 
-	return retrieved_chunk_list
-
+	# Limit to top_k AFTER filtering
+	return retrieved_chunk_list[:top_result_count]
 
 # ---------- PROMPT BUILDING ----------
 
@@ -523,6 +541,12 @@ def main() -> None:
 	)
 
 	print('\nRetrieved chunks:\n')
+
+	if DEBUG_MODE:
+		print('--- DEBUG INFO ---')
+		print(f'Top K: {TOP_RESULT_COUNT}')
+		print(f'Threshold: {MINIMUM_SIMILARITY_THRESHOLD}')
+		print('------------------\n')
 
 	for result_number, chunk_record in enumerate(retrieved_chunk_list, start=1):
 		print(f'Result {result_number}')
